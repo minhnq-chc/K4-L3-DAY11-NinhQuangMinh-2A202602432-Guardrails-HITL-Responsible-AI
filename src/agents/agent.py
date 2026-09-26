@@ -106,6 +106,7 @@ def create_blue_agent(plugins: list):
         app_name="blue_agent",
         plugins=plugins,
     )
+    agent.model = "meta-llama/llama-3.1-8b-instruct:free"
     print(
         f"Blue created WITH guardrails! "
         f"[Blue:{blue_provider_label()}]"

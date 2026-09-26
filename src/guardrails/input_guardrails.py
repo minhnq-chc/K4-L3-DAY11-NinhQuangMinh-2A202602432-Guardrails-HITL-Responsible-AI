@@ -42,6 +42,43 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+# ============================================================
+# Layer 1: Input Validation (per slide architecture)
+# Check length, language, format BEFORE sending to LLM.
+# Reject > 4000 chars, only valid UTF-8, strip control chars.
+# ============================================================
+
+MAX_INPUT_LENGTH = 4000
+
+def validate_input(user_input: str) -> InputStatus:
+    """Validate input format, length, and character composition.
+
+    Args:
+        user_input: The user's message
+
+    Returns:
+        ``"BLOCK"`` if input is invalid, ``"ALLOW"`` otherwise.
+    """
+    # 1. Empty or whitespace-only
+    if not user_input or not user_input.strip():
+        return "BLOCK"
+
+    # 2. Length check — reject > 4000 chars (prevents token abuse / prompt stuffing)
+    if len(user_input) > MAX_INPUT_LENGTH:
+        return "BLOCK"
+
+    # 3. Excessive special character ratio (> 60% non-alphanumeric, excluding spaces)
+    alnum_count = sum(1 for c in user_input if c.isalnum() or c.isspace())
+    if len(user_input) > 10 and alnum_count / len(user_input) < 0.4:
+        return "BLOCK"
+
+    return "ALLOW"
+
+
+# ============================================================
+# Layer 2: Injection Detection (pattern matching)
+# ============================================================
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
 
@@ -51,14 +88,50 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
+    # Normalize unicode and invisible characters
+    normalized_input = re.sub(r'[\u200b-\u200d\ufeff]', '', user_input)
+    
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        # --- Original patterns ---
+        r"ignore (all )?(previous|above) instructions",
+        r"you are now (unrestricted|dan|admin)",
+        r"(reveal|show me) (your )?(system )?(prompt|instructions)",
+        r"pretend you are (an? )?unrestricted",
+        r"act as (an? )?(unrestricted|admin)",
+        r"system message",
+        r"bypass (all )?(filters|guardrails)",
+
+        # --- NEW: Fill-in / completion-based extraction (Attack #2, #3) ---
+        r"(fill in|please fill|complete) .{0,40}(blank|___+|\.\.\.+|\*\*\*)",
+        r"(fill in|complete|finish) .{0,60}(password|secret|key|credential|admin|token)",
+
+        # --- NEW: Credential / access-code extraction (Attack #11) ---
+        r"(access code|credential|login detail|pass\s*word|passphrase)",
+        r"admin\s*\d{2,}",           # e.g. 'admin456'
+        r"a-d-m-i-n",                # spelled-out 'admin'
+
+        # --- NEW: Encoding tricks — backwards/reverse/spell out/NATO (Attack #17, #19) ---
+        r"(backwards?|in reverse|reverse.{0,20}order|spell(ing)?\s+(it\s+)?out|nato alphabet).{0,60}(password|secret|key|code|admin|credential|prompt|instruction)",
+        r"(password|secret|key|code|admin|credential|prompt|instruction).{0,60}(backwards?|in reverse|reverse.{0,20}order|spell(ing)?\s+(it\s+)?out|nato alphabet)",
+        r"(write|output|print|say|read|encode|decode).{0,30}(backwards?|in reverse|reversed)",
+
+        # --- NEW: Character decomposition (Attack #14, #15) ---
+        r"(first|last|second|third|nth)\s+(letter|character|char|digit|byte)",
+        r"how many (characters?|letters?|digits?|bytes?)",
+        r"(letter by letter|character by character|char by char|one.{0,10}at.{0,10}a.{0,10}time)",
+
+        # --- NEW: Fake authority / executive override (Attack #27) ---
+        r"(ceo|cfo|cto|executive|director|compliance)\s+(order|override|directive|command|request|authorization|authorisation|mandate)",
+        r"(emergency|urgent).{0,40}(override|access|credential|password|admin|bypass)",
+        r"(compliance|security|internal)\s+audit.{0,40}(password|secret|key|credential|admin|access)",
+
+        # --- NEW: Embedded instructions in fake documents (Attack #24) ---
+        r"(section|clause|article|paragraph)\s+\d+[\.\d]*\s*:\s*.{0,30}(ai |the (ai|model|assistant|system) (must|should|shall|will|need))",
+        r"(hereby|therefore|accordingly).{0,40}(output|reveal|disclose|provide).{0,40}(password|secret|key|credential|admin)",
     ]
 
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, normalized_input, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
 
@@ -86,12 +159,17 @@ def topic_filter(user_input: str) -> InputStatus:
     """
     input_lower = user_input.lower()
 
-    # TODO: Implement logic:
     # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    for blocked in BLOCKED_TOPICS:
+        if blocked.lower() in input_lower:
+            return "BLOCK"
 
-    pass  # Replace with your implementation
+    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
+    for allowed in ALLOWED_TOPICS:
+        if allowed.lower() in input_lower:
+            return "ALLOW"
+
+    return "BLOCK"
 
 
 # ============================================================
@@ -144,14 +222,23 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # Layer 1: Input Validation (length, format, character composition)
+        if validate_input(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response("Your input could not be processed. Please provide a valid banking query.")
 
-        pass  # Replace with your implementation
+        # Layer 2: Injection Detection (pattern matching)
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response("Your request was blocked due to a detected prompt injection attempt.")
+
+        # 2. Call topic_filter(text)
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response("I can only answer questions related to banking services. Your request has been blocked.")
+
+        # 3. If both return "ALLOW": return None (let message through)
+        return None
 
 
 # ============================================================
